@@ -1,0 +1,211 @@
+---
+title: "R Notebook"
+output: default
+---
+
+# Load libraries
+```{r}
+library(magrittr)    # for making code tidy
+library(recipes)     # for data set pre-processing
+library(keras)       # for modelling the LSTM
+library(lubridate)   # for date processing
+library(tidyverse)   # for tidy data
+library(quantmod)    # for getting stock data
+```
+
+# Define functions
+```{r}
+# Note: the functions create in this chunk can be found here: https://github.com/RJHKnight/MultiVariateLSTMWithKeras/blob/master/Utils.R
+
+# Reshape and expand
+reshapeForLSTM <- function(originalDF, numTimeSteps, columnsToExclude) {
+
+  originalColumnsToExclude <- columnsToExclude
+  
+  # Create new columns based on previous steps
+  for (t in 1:(numTimeSteps)) {
+    
+    originalDF %<>%
+      mutate_at(vars(-one_of(columnsToExclude)), funs(lagTmp = lag(., n = t))) %>%
+      rename_at(vars(contains("lagTmp")), ~str_replace_all(., "lagTmp", as.character(t)))
+    
+    columnsToExclude <- c(columnsToExclude, colnames(originalDF)[str_detect(colnames(originalDF), "_")])
+  }
+  
+  res_matrix <- as.matrix(select(originalDF, -originalColumnsToExclude))
+  
+  res_matrix <- res_matrix[complete.cases(res_matrix),]
+  
+  dim(res_matrix) <- c(nrow(res_matrix),numTimeSteps+1,ncol(res_matrix)/(numTimeSteps+1))
+  
+  return (originalDF)
+}
+
+reshapeForLSTMLoop <- function(originalDF, numTimeSteps, columnsToExclude) {
+  
+  originalDF <- as.data.frame(originalDF)
+  
+  colNames <- colnames(originalDF)
+  newMatrix <- as.matrix(originalDF[,!colNames %in% columnsToExclude])
+  
+  for (i in 1:ncol(originalDF)) {
+    
+    thisColName <- colNames[i]
+    
+    if (thisColName %in% columnsToExclude) {
+      next
+    }
+    
+    laggedColumns <- sapply(1:numTimeSteps, function(x) {
+      c(rep(NA, x), head(originalDF[,i], -x))
+    })
+    
+    colnames(laggedColumns) <- paste0(thisColName, "_", 1:numTimeSteps)
+    
+    newMatrix <- cbind(newMatrix, laggedColumns)
+  }
+  
+  # Remove NAs
+  newMatrix <- newMatrix[complete.cases(newMatrix),]
+  
+  dim(newMatrix) <- c(nrow(newMatrix),numTimeSteps+1,ncol(newMatrix)/(numTimeSteps+1))
+  return (newMatrix)
+}
+```
+
+# Read the data and simple manipulation
+```{r}
+# setting random number seed
+set.seed(1234)
+
+# read csv file
+AAPL <- read.csv("D:/RFile/CS5500/AAPL and microsoft stock and sentiment/FinalData.csv")
+
+# filter data to specify AAPL
+AAPL <- AAPL %>% filter(Stock == "AAPL") %>% select(-Stock)
+
+# get the next price of the day
+nextClose <- data.frame(AAPL$Adjusted[2:nrow(AAPL)]) %>% rbind(NA)
+
+# combine with original data set
+aapl <- cbind(AAPL, nextClose)
+colnames(aapl)[12] <- "nextClose"
+
+# remove the variables do not use
+aapl <- na.omit(aapl) %>% select(-c(Close, neg, neu, pos))
+
+# convert the Date into appropriate data type
+aapl$Date <- ymd(aapl$Date)
+
+# split the train and test set. Because it is a time-series data, so split in ascending order.
+aapl_train <- aapl[1:2100, ]
+aapl_test <- aapl[2101:nrow(aapl), ]
+```
+
+# Data processing
+```{r}
+trained_rec <- recipe(nextClose ~ Open + High + Low + Adjusted + Volume + compound, data = aapl) %>%  # assign the variables to be used
+  step_range(all_numeric()) %>%    # scale and centre variables in range[0,1]
+  prep(training = aapl)# estimate the required parameters from a training set that can be later applied to other data sets.
+
+# execute the pre-processing steps
+train_data <- bake(trained_rec, new_data = aapl_train)
+test_data  <- bake(trained_rec, new_data = aapl_test)
+
+
+```
+
+# Modelling
+```{r warning=FALSE}
+RMSE <- data.frame()
+table <- data.frame()
+# RMSE_t <- data.frame()
+
+
+for (j in 1:4){
+  # create the matrix which meet the requirement of LSTM using 2 defined functions. Change the numTimeSteps you need.
+train_X <- reshapeForLSTMLoop(train_data, numTimeSteps = j, columnsToExclude = "nextClose")
+train_Y <- as.matrix(tail(train_data$nextClose, -j))
+test_X <- reshapeForLSTMLoop(test_data, numTimeSteps = j, columnsToExclude = "nextClose")
+test_Y <- as.matrix(tail(test_data$nextClose, -j))
+
+for (i in 1:20){
+model <- keras_model_sequential()
+
+# set the layers
+model %>%
+  layer_lstm(units = 64, 
+             input_shape = c(dim(train_X)[2], dim(train_X)[3]),
+             return_sequences = TRUE,
+             activation = "relu") %>%
+  layer_lstm(units = 32, 
+             return_sequences = TRUE,
+             activation = "relu") %>%
+  layer_lstm(units = 16,
+             return_sequences = FALSE,
+             activation = "relu") %>%
+  layer_dense(units = 1,
+              activation = "sigmoid")
+
+# compile
+model %>%
+  compile(loss = "mse", optimizer = "adam")
+
+# fit
+model %>%
+  fit(train_X, 
+      train_Y, 
+      epochs = 10, 
+      batch_size = 30,
+      validation_data = list(test_X, test_Y), 
+      verbose = 1,
+      shuffle = FALSE)
+
+# predict value
+pred <- model %>% predict(test_X)
+
+# call the original values
+ranges <- trained_rec$steps[[1]]$ranges
+
+# inverse normalize
+pred <- c(rep(NA, j), pred * ranges[2,4])
+
+# add new column for later plotting
+aapl_test$predictedValue <- pred
+
+# calculate the RMSE
+RMSE[i,j] <- sqrt(mean((pred - aapl_test$nextClose)^2, na.rm = TRUE))
+}
+}
+
+# the minimum RMSE
+min_RMSE <- apply(RMSE, 2, min) %>% as.data.frame()
+
+# convert to data frame
+for (k in 1:4) {
+after_filter <- filter(RMSE[k], RMSE[k] < 2 * min_RMSE[k,1])
+table[1:nrow(after_filter), k] <- after_filter #filter(RMSE[k], RMSE[k] < 2 * min_RMSE[k,1])
+}
+
+# calculate the Average RMSE
+c_timestep_table <- apply(table, 2, mean, na.rm = T) %>% data.frame()
+rownames(c_timestep_table) <- c("t-2", "t-3", "t-4", "t-5")
+colnames(c_timestep_table) <- c("avg_RMSE_c")
+c_timestep_table <- t(c_timestep_table) %>% data.frame()
+c_timestep_table
+```
+
+# Plotting
+```{r warning=FALSE}
+# plot
+ggplot(aapl_test, aes(x = Date)) + 
+  geom_line(aes(y = nextClose, color = "Actual")) +    # actual
+  geom_line(aes(y = predictedValue, color = "Prediction")) +  # pred
+  theme_light() +
+  scale_colour_manual("",
+                      breaks = c("Actual","Prediction"),
+                      values = c("Actual"="gray","Prediction"="orange")) +
+  theme(legend.position = "top")
+```
+
+

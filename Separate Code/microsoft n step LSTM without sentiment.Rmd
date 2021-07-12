@@ -1,0 +1,202 @@
+---
+title: "R Notebook"
+output: default
+---
+
+# Load libraries
+```{r}
+library(magrittr)    # for making code tidy
+library(recipes)     # for data set pre-processing
+library(keras)       # for modelling the LSTM
+library(lubridate)   # for date processing
+library(tidyverse)   # for tidy data
+library(quantmod)    # for getting stock data
+```
+
+# Define functions
+```{r}
+# Note: the functions create in this chunk can be found here: https://github.com/RJHKnight/MultiVariateLSTMWithKeras/blob/master/Utils.R
+
+# Reshape and expand
+reshapeForLSTM <- function(originalDF, numTimeSteps, columnsToExclude) {
+
+  originalColumnsToExclude <- columnsToExclude
+  
+  # Create new columns based on previous steps
+  for (t in 1:(numTimeSteps)) {
+    
+    originalDF %<>%
+      mutate_at(vars(-one_of(columnsToExclude)), funs(lagTmp = lag(., n = t))) %>%
+      rename_at(vars(contains("lagTmp")), ~str_replace_all(., "lagTmp", as.character(t)))
+    
+    columnsToExclude <- c(columnsToExclude, colnames(originalDF)[str_detect(colnames(originalDF), "_")])
+  }
+  
+  res_matrix <- as.matrix(select(originalDF, -originalColumnsToExclude))
+  
+  res_matrix <- res_matrix[complete.cases(res_matrix),]
+  
+  dim(res_matrix) <- c(nrow(res_matrix),numTimeSteps+1,ncol(res_matrix)/(numTimeSteps+1))
+  
+  return (originalDF)
+}
+
+reshapeForLSTMLoop <- function(originalDF, numTimeSteps, columnsToExclude) {
+  
+  originalDF <- as.data.frame(originalDF)
+  
+  colNames <- colnames(originalDF)
+  newMatrix <- as.matrix(originalDF[,!colNames %in% columnsToExclude])
+  
+  for (i in 1:ncol(originalDF)) {
+    
+    thisColName <- colNames[i]
+    
+    if (thisColName %in% columnsToExclude) {
+      next
+    }
+    
+    laggedColumns <- sapply(1:numTimeSteps, function(x) {
+      c(rep(NA, x), head(originalDF[,i], -x))
+    })
+    
+    colnames(laggedColumns) <- paste0(thisColName, "_", 1:numTimeSteps)
+    
+    newMatrix <- cbind(newMatrix, laggedColumns)
+  }
+  
+  # Remove NAs
+  newMatrix <- newMatrix[complete.cases(newMatrix),]
+  
+  dim(newMatrix) <- c(nrow(newMatrix),numTimeSteps+1,ncol(newMatrix)/(numTimeSteps+1))
+  return (newMatrix)
+}
+```
+
+# Read the data and simple manipulation
+```{r}
+# setting random number seed
+set.seed(1234)
+
+# read csv file
+MSFT <- read.csv("D:/RFile/CS5500/AAPL and microsoft stock and sentiment/FinalData.csv")
+
+# filter data to specify MSFT
+MSFT <- MSFT %>% filter(Stock == "MSFT") %>% select(-Stock)
+
+# get the next price of the day
+nextClose <- data.frame(MSFT$Adjusted[2:nrow(MSFT)]) %>% rbind(NA)
+
+# combine with original data set
+microsoft <- cbind(MSFT, nextClose)
+colnames(microsoft)[12] <- "nextClose"
+
+# remove the variables do not use
+microsoft <- na.omit(microsoft) %>% select(-c(Close, compound, neg, neu, pos))
+
+# convert the Date into appropriate data type
+microsoft$Date <- ymd(microsoft$Date)
+
+# split the train and test set. Because it is a time-series data, so split in ascending order.
+microsoft_train <- microsoft[1:2100, ]
+microsoft_test <- microsoft[2101:nrow(microsoft), ]
+```
+
+# Data processing
+```{r}
+trained_rec <- recipe(nextClose ~ Open + High + Low + Adjusted + Volume, data = microsoft) %>%  # assign the variables to be used
+  step_range(all_numeric()) %>%    # scale and centre variables in range[0,1]
+  prep(training = microsoft)# estimate the required parameters from a training set that can be later applied to other data sets.
+
+# execute the pre-processing steps
+train_data <- bake(trained_rec, new_data = microsoft_train)
+test_data  <- bake(trained_rec, new_data = microsoft_test)
+
+# create the matrix which meet the requirement of LSTM using 2 defined functions
+train_X <- reshapeForLSTMLoop(train_data, numTimeSteps = 4, columnsToExclude = "nextClose")
+train_Y <- as.matrix(tail(train_data$nextClose, -4))
+test_X <- reshapeForLSTMLoop(test_data, numTimeSteps = 4, columnsToExclude = "nextClose")
+test_Y <- as.matrix(tail(test_data$nextClose, -4))
+```
+
+# Modelling
+```{r warning=FALSE}
+RMSE <- c()
+
+for (i in 1:20){
+model <- keras_model_sequential()
+
+# set the layers
+model %>%
+  layer_lstm(units = 64, 
+             input_shape = c(dim(train_X)[2], dim(train_X)[3]),
+             return_sequences = TRUE,
+             activation = "relu") %>%
+  layer_lstm(units = 32, 
+             return_sequences = TRUE,
+             activation = "relu") %>%
+  layer_lstm(units = 16,
+             return_sequences = FALSE,
+             activation = "relu") %>%
+  #layer_dropout(rate = 0.1) %>% 
+  layer_dense(units = 1,
+              activation = "sigmoid")
+
+# compile
+model %>%
+  compile(loss = "mse", optimizer = "adam")
+
+# fit
+model %>%
+  fit(train_X, 
+      train_Y, 
+      epochs = 25, 
+      batch_size = 30,
+      validation_data = list(test_X, test_Y), 
+      verbose = 1,
+      shuffle = FALSE)
+
+# predict value
+pred <- model %>% predict(test_X)
+
+# call the original values
+ranges <- trained_rec$steps[[1]]$ranges
+
+# inverse normalize
+pred <- c(rep(NA, 4), pred * ranges[2,4])
+
+# add new column for later plotting
+microsoft_test$predictedValue <- pred
+
+# calculate the RMSE
+RMSE[i] <- sqrt(mean((pred - microsoft_test$nextClose)^2, na.rm = TRUE))
+}
+
+# calculate the Average RMSE
+min_RMSE <- min(RMSE)
+RMSE <- RMSE %>% as.data.frame() %>% filter(. < 2 * min_RMSE)
+cat("The Average RMSE is:", sum(RMSE)/nrow(RMSE))
+```
+
+# Plotting
+```{r warning=FALSE}
+
+
+# plot
+ggplot(microsoft_test, aes(x = Date)) + 
+  geom_line(aes(y = nextClose, color = "Actual")) +    # actual
+  geom_line(aes(y = predictedValue, color = "Prediction")) +  # pred
+  theme_light() +
+  scale_colour_manual("",
+                      breaks = c("Actual","Prediction"),
+                      values = c("Actual"="gray","Prediction"="orange")) +
+  theme(legend.position = "top")
+```
+
+```{r}
+# (4.473664 + 4.553301 + 3.196638 + 3.926972 + 4.967555)/5
+
+#  re-jilu
+# (3.035821 + 5.712911 + 4.274354 + 3.636439 + 5.479527)/5
+```
+

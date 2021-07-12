@@ -1,0 +1,371 @@
+---
+title: "R Notebook"
+output: default
+---
+
+# Load libraries
+```{r}
+library(magrittr)    # for making code tidy
+library(recipes)     # for data set pre-processing
+library(keras)       # for modelling the LSTM
+library(lubridate)   # for date processing
+library(tidyverse)   # for tidy data
+library(quantmod)    # for getting stock data
+```
+
+# AAPL
+## Read the data and simple manipulation
+```{r}
+# setting random number seed
+set.seed(1234)
+
+# read csv file
+AAPL <- read.csv("D:/RFile/CS5500/AAPL and microsoft stock and sentiment/FinalData.csv")
+
+# filter data to specify AAPL
+AAPL <- AAPL %>% filter(Stock == "AAPL") %>% select(-Stock)
+
+# get the next price of the day
+nextClose <- data.frame(AAPL$Adjusted[2:nrow(AAPL)]) %>% rbind(NA)
+
+# combine with original data set
+aapl <- cbind(AAPL, nextClose)
+colnames(aapl)[12] <- "nextClose"
+
+# remove the variables do not use
+aapl <- na.omit(aapl) %>% select(-Close)
+
+# convert the Date into appropriate data type
+aapl$Date <- ymd(aapl$Date)
+
+# split the train and test set. Because it is a time-series data, so split in ascending order.
+aapl_train <- aapl[1:2100, ]
+aapl_test <- aapl[2101:nrow(aapl), ]
+```
+
+## LSTMN t-1
+### Data processing
+```{r}
+trained_rec <- recipe(nextClose ~ Open + High + Low + Adjusted + Volume, data = aapl) %>%  # assign the variables to be used
+  step_range(all_numeric()) %>%    # scale and centre variables in range[0,1]
+  prep(training = aapl)# estimate the required parameters from a training set that can be later applied to other data sets.
+
+# execute the pre-processing steps
+train_data <- bake(trained_rec, new_data = aapl_train)
+test_data  <- bake(trained_rec, new_data = aapl_test)
+
+train_X <- as.matrix(train_data[,-6])
+train_Y <- as.matrix(train_data$nextClose)
+test_X <- as.matrix(test_data[,-6])
+test_Y <- as.matrix(test_data$nextClose)
+
+dim(train_X) <- c(nrow(train_X),1,ncol(train_X))
+dim(test_X) <- c(nrow(test_X),1,ncol(test_X))
+```
+
+### Modelling
+```{r warning=FALSE}
+RMSE_n <- c()
+
+for (i in 1:5){
+model <- keras_model_sequential()
+
+# set the layers
+model %>%
+  layer_lstm(units = 64, 
+             input_shape = c(dim(train_X)[2], dim(train_X)[3]),
+             return_sequences = TRUE,
+             activation = "relu") %>%
+  layer_lstm(units = 32, 
+             return_sequences = TRUE,
+             activation = "relu") %>%
+  layer_lstm(units = 16,
+             return_sequences = FALSE,
+             activation = "relu") %>%
+  layer_dense(units = 1,
+              activation = "sigmoid")
+
+# compile
+model %>%
+  compile(loss = "mse", optimizer = "adam")
+
+# fit
+model %>%
+  fit(train_X, 
+      train_Y, 
+      epochs = 15, 
+      batch_size = 30,
+      validation_data = list(test_X, test_Y), 
+      verbose = 1,
+      shuffle = FALSE)
+
+# predict value
+pred <- model %>% predict(test_X)
+
+# call the original values
+ranges <- trained_rec$steps[[1]]$ranges
+
+# inverse normalize
+pred <- pred * ranges[2,4]
+
+# add new column for later plotting
+aapl_test$predictedValue <- pred
+
+# calculate the RMSE
+RMSE_n[i] <- sqrt(mean((pred - aapl_test$nextClose)^2, na.rm = TRUE))
+}
+
+# calculate the Average RMSE
+min_RMSE_n <- min(RMSE_n)
+RMSE_n <- RMSE_n %>% as.data.frame() %>% filter(. < 2 * min_RMSE_n)
+avg_RMSE_n <- sum(RMSE_n)/nrow(RMSE_n)
+cat("The Average RMSE is:", avg_RMSE_n)
+```
+
+## LSTMP t-1
+### Data processing
+```{r}
+trained_rec <- recipe(nextClose ~ Open + High + Low + Adjusted + Volume + neg + neu + pos, data = aapl) %>%  # assign the variables to be used
+  step_range(all_numeric()) %>%    # scale and centre variables in range[0,1]
+  prep(training = aapl)# estimate the required parameters from a training set that can be later applied to other data sets.
+
+# execute the pre-processing steps
+train_data <- bake(trained_rec, new_data = aapl_train)
+test_data  <- bake(trained_rec, new_data = aapl_test)
+
+train_X <- as.matrix(train_data[,-9])
+train_Y <- as.matrix(train_data$nextClose)
+test_X <- as.matrix(test_data[,-9])
+test_Y <- as.matrix(test_data$nextClose)
+
+dim(train_X) <- c(nrow(train_X),1,ncol(train_X))
+dim(test_X) <- c(nrow(test_X),1,ncol(test_X))
+```
+
+### Modelling
+```{r warning=FALSE}
+RMSE_p <- c()
+
+for (i in 1:5){
+model <- keras_model_sequential()
+
+# set the layers
+model %>%
+  layer_lstm(units = 64, 
+             input_shape = c(dim(train_X)[2], dim(train_X)[3]),
+             return_sequences = TRUE,
+             activation = "relu") %>%
+  layer_lstm(units = 32, 
+             return_sequences = TRUE,
+             activation = "relu") %>%
+  layer_lstm(units = 16,
+             return_sequences = FALSE,
+             activation = "relu") %>%
+  layer_dense(units = 1,
+              activation = "sigmoid")
+
+# compile
+model %>%
+  compile(loss = "mse", optimizer = "adam")
+
+# fit
+model %>%
+  fit(train_X, 
+      train_Y, 
+      epochs = 15, 
+      batch_size = 30,
+      validation_data = list(test_X, test_Y), 
+      verbose = 1,
+      shuffle = FALSE)
+
+# predict value
+pred <- model %>% predict(test_X)
+
+# call the original values
+ranges <- trained_rec$steps[[1]]$ranges
+
+# inverse normalize
+pred <- pred * ranges[2,4]
+
+# add new column for later plotting
+aapl_test$predictedValue <- pred
+
+# calculate the RMSE
+RMSE_p[i] <- sqrt(mean((pred - aapl_test$nextClose)^2, na.rm = TRUE))
+}
+
+# calculate the Average RMSE
+min_RMSE_p <- min(RMSE_p)
+RMSE_p <- RMSE_p %>% as.data.frame() %>% filter(. < 2 * min_RMSE_p)
+avg_RMSE_p <- sum(RMSE_p)/nrow(RMSE_p)
+cat("The Average RMSE is:", avg_RMSE_p)
+```
+
+## LSTMC t-1
+### Data processing
+```{r}
+trained_rec <- recipe(nextClose ~ Open + High + Low + Adjusted + Volume + compound, data = aapl) %>%  # assign the variables to be used
+  step_range(all_numeric()) %>%    # scale and centre variables in range[0,1]
+  prep(training = aapl)# estimate the required parameters from a training set that can be later applied to other data sets.
+
+# execute the pre-processing steps
+train_data <- bake(trained_rec, new_data = aapl_train)
+test_data  <- bake(trained_rec, new_data = aapl_test)
+
+train_X <- as.matrix(train_data[,-7])
+train_Y <- as.matrix(train_data$nextClose)
+test_X <- as.matrix(test_data[,-7])
+test_Y <- as.matrix(test_data$nextClose)
+
+dim(train_X) <- c(nrow(train_X),1,ncol(train_X))
+dim(test_X) <- c(nrow(test_X),1,ncol(test_X))
+```
+
+### Modelling
+```{r warning=FALSE}
+RMSE_c <- c()
+
+for (i in 1:5){
+model <- keras_model_sequential()
+
+# set the layers
+model %>%
+  layer_lstm(units = 64, 
+             input_shape = c(dim(train_X)[2], dim(train_X)[3]),
+             return_sequences = TRUE,
+             activation = "relu") %>%
+  layer_lstm(units = 32, 
+             return_sequences = TRUE,
+             activation = "relu") %>%
+  layer_lstm(units = 16,
+             return_sequences = FALSE,
+             activation = "relu") %>%
+  layer_dense(units = 1,
+              activation = "sigmoid")
+
+# compile
+model %>%
+  compile(loss = "mse", optimizer = "adam")
+
+# fit
+model %>%
+  fit(train_X, 
+      train_Y, 
+      epochs = 15, 
+      batch_size = 30,
+      validation_data = list(test_X, test_Y), 
+      verbose = 1,
+      shuffle = FALSE)
+
+# predict value
+pred <- model %>% predict(test_X)
+
+# call the original values
+ranges <- trained_rec$steps[[1]]$ranges
+
+# inverse normalize
+pred <- pred * ranges[2,4]
+
+# add new column for later plotting
+aapl_test$predictedValue <- pred
+
+# calculate the RMSE
+RMSE_c[i] <- sqrt(mean((pred - aapl_test$nextClose)^2, na.rm = TRUE))
+}
+
+# calculate the Average RMSE
+min_RMSE_c <- min(RMSE_c)
+RMSE_c <- RMSE_c %>% as.data.frame() %>% filter(. < 2 * min_RMSE_c)
+avg_RMSE_c <- sum(RMSE_c)/nrow(RMSE_c)
+cat("The Average RMSE is:", avg_RMSE_c)
+```
+
+## LSTMA t-1
+### Data processing
+```{r}
+trained_rec <- recipe(nextClose ~ Open + High + Low + Adjusted + Volume + compound + neg + neu + pos, data = aapl) %>%  # assign the variables to be used
+  step_range(all_numeric()) %>%    # scale and centre variables in range[0,1]
+  prep(training = aapl)# estimate the required parameters from a training set that can be later applied to other data sets.
+
+# execute the pre-processing steps
+train_data <- bake(trained_rec, new_data = aapl_train)
+test_data  <- bake(trained_rec, new_data = aapl_test)
+
+train_X <- as.matrix(train_data[,-10])
+train_Y <- as.matrix(train_data$nextClose)
+test_X <- as.matrix(test_data[,-10])
+test_Y <- as.matrix(test_data$nextClose)
+
+dim(train_X) <- c(nrow(train_X),1,ncol(train_X))
+dim(test_X) <- c(nrow(test_X),1,ncol(test_X))
+```
+
+### Modelling
+```{r warning=FALSE}
+RMSE_a <- c()
+
+for (i in 1:5){
+model <- keras_model_sequential()
+
+# set the layers
+model %>%
+  layer_lstm(units = 64, 
+             input_shape = c(dim(train_X)[2], dim(train_X)[3]),
+             return_sequences = TRUE,
+             activation = "relu") %>%
+  layer_lstm(units = 32, 
+             return_sequences = TRUE,
+             activation = "relu") %>%
+  layer_lstm(units = 16,
+             return_sequences = FALSE,
+             activation = "relu") %>%
+  layer_dense(units = 1,
+              activation = "sigmoid")
+
+# compile
+model %>%
+  compile(loss = "mse", optimizer = "adam")
+
+# fit
+model %>%
+  fit(train_X, 
+      train_Y, 
+      epochs = 15, 
+      batch_size = 30,
+      validation_data = list(test_X, test_Y), 
+      verbose = 1,
+      shuffle = FALSE)
+
+# predict value
+pred <- model %>% predict(test_X)
+
+# call the original values
+ranges <- trained_rec$steps[[1]]$ranges
+
+# inverse normalize
+pred <- pred * ranges[2,4]
+
+# add new column for later plotting
+aapl_test$predictedValue <- pred
+
+# calculate the RMSE
+RMSE_a[i] <- sqrt(mean((pred - aapl_test$nextClose)^2, na.rm = TRUE))
+}
+
+# calculate the Average RMSE
+min_RMSE <- min(RMSE_a)
+RMSE_a <- RMSE_a %>% as.data.frame() %>% filter(. < 2 * min_RMSE)
+avg_RMSE_a <- sum(RMSE_a)/nrow(RMSE_a)
+cat("The Average RMSE is:", avg_RMSE_a)
+```
+
+## AAPL t-1 table
+```{r}
+aapl_t_1_table <- rbind(avg_RMSE_n, avg_RMSE_p, avg_RMSE_c, avg_RMSE_a) %>% as.data.frame()
+colnames(aapl_t_1_table) <- c("t.1")
+aapl_t_1_table
+```
+
+
+
+
